@@ -1,0 +1,21 @@
+Entry Direction Summary
+Direction,Total,Motorcycles,Cars,Buses,Trucks
+North,1203,988,214,1,0
+East,3150,2730,417,3,0
+South,1450,1340,105,5,0
+West,4301,3650,642,9,0
+
+Route Statistics
+Route,Count,Percentage
+east→north,245,2.4%
+east→south,474,4.7%
+east→west,2431,24.1%
+north→east,138,1.4%
+north→south,345,3.4%
+north→west,720,7.1%
+south→east,755,7.5%
+south→north,85,0.8%
+south→west,610,6.0%
+west→east,2912,28.8%
+west→north,201,2.0%
+west→south,1188,11.8%

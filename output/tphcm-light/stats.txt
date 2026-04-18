@@ -1,0 +1,80 @@
+============================================================
+VEHICLE DIRECTION ANALYSIS
+============================================================
+Route File: sumo_files/tphcm-light/route.rou.xml
+Total Vehicles: 10104
+============================================================
+
+────────────────────────────────────────────────────────────
+🚗 VEHICLES FROM EACH DIRECTION (ENTRY)
+────────────────────────────────────────────────────────────
+NORTH     : 1203 vehicles ( 11.9%) (bus:1, car:214, motorcycle:988)
+EAST      : 3150 vehicles ( 31.2%) (bus:3, car:417, motorcycle:2730)
+SOUTH     : 1450 vehicles ( 14.4%) (bus:5, car:105, motorcycle:1340)
+WEST      : 4301 vehicles ( 42.6%) (bus:9, car:642, motorcycle:3650)
+
+────────────────────────────────────────────────────────────
+🚦 VEHICLES TO EACH DIRECTION (EXIT)
+────────────────────────────────────────────────────────────
+NORTH     :  531 vehicles (  5.3%)
+EAST      : 3805 vehicles ( 37.7%)
+SOUTH     : 2007 vehicles ( 19.9%)
+WEST      : 3761 vehicles ( 37.2%)
+
+────────────────────────────────────────────────────────────
+🚙 VEHICLE TYPES
+────────────────────────────────────────────────────────────
+Bus            :   18 vehicles (  0.2%)
+Car            : 1378 vehicles ( 13.6%)
+Motorcycle     : 8708 vehicles ( 86.2%)
+
+────────────────────────────────────────────────────────────
+📊 DETAILED BREAKDOWN BY ENTRY DIRECTION
+────────────────────────────────────────────────────────────
+
+NORTH (1203 vehicles):
+  Bus         :    1 (  0.1%)
+  Car         :  214 ( 17.8%)
+  Motorcycle  :  988 ( 82.1%)
+
+EAST (3150 vehicles):
+  Bus         :    3 (  0.1%)
+  Car         :  417 ( 13.2%)
+  Motorcycle  : 2730 ( 86.7%)
+
+SOUTH (1450 vehicles):
+  Bus         :    5 (  0.3%)
+  Car         :  105 (  7.2%)
+  Motorcycle  : 1340 ( 92.4%)
+
+WEST (4301 vehicles):
+  Bus         :    9 (  0.2%)
+  Car         :  642 ( 14.9%)
+  Motorcycle  : 3650 ( 84.9%)
+
+────────────────────────────────────────────────────────────
+🔀 TOP 10 ROUTES
+────────────────────────────────────────────────────────────
+west→east                : 2912 vehicles ( 28.8%)
+east→west                : 2431 vehicles ( 24.1%)
+west→south               : 1188 vehicles ( 11.8%)
+south→east               :  755 vehicles (  7.5%)
+north→west               :  720 vehicles (  7.1%)
+south→west               :  610 vehicles (  6.0%)
+east→south               :  474 vehicles (  4.7%)
+north→south              :  345 vehicles (  3.4%)
+east→north               :  245 vehicles (  2.4%)
+west→north               :  201 vehicles (  2.0%)
+
+============================================================
+✅ Statistics saved to direction_statistics.csv
+
+============================================================
+QUICK SUMMARY
+============================================================
+North: 1203 vehicles
+East:  3150 vehicles
+South: 1450 vehicles
+West:  4301 vehicles
+TOTAL: 10104 vehicles
+============================================================
