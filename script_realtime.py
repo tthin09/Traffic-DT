@@ -16,9 +16,10 @@ import cv2
 import os
 import sys
 import math
-import json
 import argparse
-import numpy as np
+import time as _time
+import threading
+import queue
 import xml.etree.ElementTree as ET
 from ultralytics import YOLO
 
@@ -52,11 +53,12 @@ VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 TRACKED_CLASS_IDS = {2, 3, 5, 8}
 
 # Pre-defined vehicle type dimensions for SUMO
+# Default acceleration = 1.5 m/s², max velocity = 10 m/s for all types
 VTYPE_DIMENSIONS = {
     "motorcycle": {
         "length": "2.2", "width": "0.8", "minGap": "0.5",
         "minGapLat": "0.3", "maxSpeedLat": "1.0", "latAlignment": "center",
-        "accel": "2.5", "decel": "6.0", "sigma": "0.5",
+        "accel": "1.5", "decel": "6.0", "sigma": "0.5",
         "guiShape": "motorcycle",
     },
     "car": {
@@ -68,18 +70,16 @@ VTYPE_DIMENSIONS = {
     "bus": {
         "length": "12.0", "width": "2.5", "minGap": "2.5",
         "minGapLat": "0.8", "maxSpeedLat": "0.3", "latAlignment": "center",
-        "accel": "0.8", "decel": "4.0", "sigma": "0.5",
+        "accel": "1.5", "decel": "4.0", "sigma": "0.5",
         "guiShape": "bus",
     },
     "truck": {
         "length": "8.0", "width": "2.3", "minGap": "2.5",
         "minGapLat": "0.7", "maxSpeedLat": "0.4", "latAlignment": "center",
-        "accel": "1.0", "decel": "4.5", "sigma": "0.5",
+        "accel": "1.5", "decel": "4.5", "sigma": "0.5",
         "guiShape": "truck",
     },
 }
-
-DEFAULT_SPEED_KMH = 36.0  # 36 km/h = 10 m/s — must be >= departSpeed (10 m/s)
 
 # All possible routes through the intersection
 ROUTE_DEFINITIONS = {
@@ -102,97 +102,18 @@ OPPOSITE_DIRECTION = {
     "east": "west",   "west": "east",
 }
 
-# Number of frames a vehicle can be missing before being released to auto-drive
+# Number of frames a vehicle can be missing before being removed
 LOST_VEHICLE_THRESHOLD = 30  # ~1 second at 30fps
-
-# The visible road length in the video (meters)
-# Vehicles will be mapped to only this range near the intersection
-VISIBLE_ROAD_LENGTH = 10.0
-
-# Total SUMO edge length (distance from outer node to center = 100m)
-SUMO_EDGE_LENGTH = 100.0
 
 # Minimum cumulative pixel displacement before a vehicle is injected into SUMO.
 # Filters out parked vehicles that YOLO detects but never actually move.
 MIN_MOVEMENT_PX = 20.0
 
+# Default max speed in m/s
+DEFAULT_MAX_SPEED_MS = 10.0
 
-# ============================================================
-# Pixel → SUMO Edge-Based Position Mapping
-# ============================================================
 
-class EdgePositionMapper:
-    """
-    Maps pixel coordinates to SUMO edge + normalized position (0..1) by
-    projecting the vehicle's pixel position onto the road's center line.
 
-    Returns (edge_id, t) where t=0 is at the far entry, t=1 is at the center.
-    Uses traci.vehicle.moveTo() which guarantees vehicles are ON the lane.
-    """
-
-    # Pixel reference lines for each road direction:
-    #   "far"  = where vehicles enter the frame (far from intersection)
-    #   "near" = where the road meets the intersection center
-    # Estimated from regions.json polygon boundaries.
-    PIXEL_AXES = {
-        "north": {"far": (835, 0),      "near": (912, 348)},
-        "east":  {"far": (1920, 468),   "near": (1105, 488)},
-        "south": {"far": (1195, 1080),  "near": (770, 678)},
-        "west":  {"far": (0, 520),      "near": (978, 538)},
-    }
-
-    def map_to_edge(self, px_cx, px_cy, region, entry_region):
-        """
-        Map a pixel position to a SUMO edge + normalized position.
-
-        The video only covers ~10m of road near the intersection.
-        We map that to the last 10m of the 100m SUMO edge (positions 90-100m
-        for inbound, 0-10m for outbound).
-
-        :param px_cx: Vehicle pixel center X
-        :param px_cy: Vehicle pixel center Y
-        :param region: Current detected region (north/south/east/west)
-        :param entry_region: Region where this vehicle first appeared
-        :returns: (edge_id, t) where t is 0..1 along the edge, or None
-        """
-        if region is None or region not in self.PIXEL_AXES:
-            return None
-
-        # Determine if vehicle is inbound (approaching center) or outbound
-        if region == entry_region:
-            edge_id = f"{region}_to_center"      # inbound
-        else:
-            edge_id = f"center_to_{region}"       # outbound
-
-        # Project pixel position onto the road axis to get t_pixel ∈ [0, 1]
-        # t_pixel=0 means at the "far" end (entry), t_pixel=1 means at "near" (center)
-        axis = self.PIXEL_AXES[region]
-        far = np.array(axis["far"], dtype=np.float64)
-        near = np.array(axis["near"], dtype=np.float64)
-        point = np.array([px_cx, px_cy], dtype=np.float64)
-
-        axis_vec = near - far
-        t_pixel = np.dot(point - far, axis_vec) / np.dot(axis_vec, axis_vec)
-        t_pixel = np.clip(t_pixel, 0.0, 1.0)
-
-        # Map t_pixel to only the last VISIBLE_ROAD_LENGTH meters of the edge.
-        # For inbound edges (X_to_center): visible zone is [EDGE_LENGTH - VISIBLE, EDGE_LENGTH]
-        #   t_pixel=0 (far in video) -> position = EDGE_LENGTH - VISIBLE_ROAD_LENGTH
-        #   t_pixel=1 (near center)  -> position = EDGE_LENGTH
-        # We express as normalized t over the full edge:
-        visible_fraction = VISIBLE_ROAD_LENGTH / SUMO_EDGE_LENGTH  # 0.10
-        start_fraction = 1.0 - visible_fraction  # 0.90
-
-        if region == entry_region:
-            # Inbound: map to last 10m (t = 0.90 .. 0.99)
-            t = start_fraction + t_pixel * visible_fraction
-            t = np.clip(t, start_fraction + 0.01, 0.99)
-        else:
-            # Outbound (center_to_X): map to first 10m (t = 0.01 .. 0.10)
-            t = (1.0 - t_pixel) * visible_fraction
-            t = np.clip(t, 0.01, visible_fraction - 0.01)
-
-        return edge_id, float(t)
 
 
 # ============================================================
@@ -236,7 +157,7 @@ def generate_empty_route_file(output_file):
 
     # Pre-define vehicle types
     for cls_name, dims in VTYPE_DIMENSIONS.items():
-        attrs = {"id": f"vType_{cls_name}", "maxSpeed": str(DEFAULT_SPEED_KMH / 3.6)}
+        attrs = {"id": f"vType_{cls_name}", "maxSpeed": str(DEFAULT_MAX_SPEED_MS)}
         attrs.update(dims)
         ET.SubElement(root, "vType", **attrs)
 
@@ -308,44 +229,39 @@ def setup_sumo_network(output_dir):
     print("SUMO network files generated successfully!")
 
 
-# ============================================================
-# TraCI Vehicle Management
-# ============================================================
-
 class VehicleManager:
     """
     Manages the lifecycle of vehicles in the SUMO simulation.
-    Tracks which vehicles are active, adds new ones, updates positions,
-    and removes vehicles that are no longer detected.
 
-    Uses a Movement Distance Filter: vehicles must accumulate at least
-    MIN_MOVEMENT_PX pixels of displacement before being injected into SUMO.
-    This filters out parked vehicles.
+    Spawn-and-release strategy:
+      - When a new vehicle is detected and has moved enough pixels (not parked),
+        spawn it at the start of its entry edge with a default straight-through route.
+      - Immediately release it to SUMO's autonomous driving (accel=1.5, maxSpeed=10).
+      - Do NOT control the vehicle's position after spawn.
+
+    Turn detection:
+      - Each frame, check the vehicle's current region from the video (via regions.json).
+      - If the current region differs from the entry region, the vehicle has turned.
+      - Change the vehicle's route in SUMO to match the observed turn direction.
     """
 
-    def __init__(self, edge_mapper):
-        self.edge_mapper = edge_mapper
-        self.active_vehicles = {}    # object_id -> {sumo_id, class, entry, last_seen_frame, ...}
-        self.pending_vehicles = {}   # object_id -> {first_cx, first_cy, last_cx, last_cy,
-                                     #               cumulative_dist, class, entry, last_frame}
+    def __init__(self):
+        self.active_vehicles = {}    # object_id -> {sumo_id, class, entry, last_seen_frame, current_route_exit}
+        self.pending_vehicles = {}   # object_id -> {last_cx, last_cy, cumulative_dist, class, entry, last_frame}
         self.total_added = 0
         self.total_removed = 0
         self.total_filtered = 0      # Parked vehicles that were never injected
+        self.total_rerouted = 0      # Vehicles whose route was changed due to turn detection
 
-    def update_vehicle(self, object_id, px_cx, px_cy, speed_kmh, vehicle_class,
+    def update_vehicle(self, object_id, px_cx, px_cy, vehicle_class,
                        entry_region, current_region, frame_count):
         """
-        Update a vehicle's position in SUMO. If the vehicle doesn't exist yet,
-        check if it has moved enough to be considered a real moving vehicle.
-
-        New vehicles are hard-spawned at a queue-aware position 10 m behind the
-        intersection (see _add_vehicle). The pixel-based _move_vehicle is NOT
-        called on the first spawn frame so the initial position is preserved.
+        Update a vehicle. If new, check movement filter then spawn.
+        If already active, check for turn detection and reroute if needed.
 
         :param object_id: YOLO tracker ID
         :param px_cx: Pixel center X
         :param px_cy: Pixel center Y
-        :param speed_kmh: Detected speed in km/h
         :param vehicle_class: 'car', 'motorcycle', 'bus', 'truck'
         :param entry_region: The region where the vehicle first appeared
         :param current_region: The region the vehicle is currently in
@@ -382,47 +298,112 @@ class VehicleManager:
             if pending["cumulative_dist"] < MIN_MOVEMENT_PX:
                 return False  # Still hasn't moved enough — probably parked
 
-            mapping = self.edge_mapper.map_to_edge(px_cx, px_cy, current_region, pending["entry"])
-            if mapping is None:
-                return False  # Wait until it maps to a valid lane
-
-            # Vehicle has moved enough! Promote to active with hard-spawn.
+            # Vehicle has moved enough! Promote to active with spawn-and-release.
             entry_region = pending["entry"]
             del self.pending_vehicles[object_id]
 
-            _, t_position = mapping
+            if entry_region is None:
+                return False  # Can't spawn without knowing entry direction
+
             sumo_id = f"veh_{object_id}"
-            if not self._add_vehicle(sumo_id, vehicle_class, entry_region, t_position):
+            if not self._spawn_vehicle(sumo_id, vehicle_class, entry_region):
                 return False
 
+            # Default route exit is straight through (opposite direction)
+            default_exit = OPPOSITE_DIRECTION.get(entry_region, "south")
             self.active_vehicles[object_id] = {
                 "sumo_id": sumo_id,
                 "class": vehicle_class,
                 "entry": entry_region,
                 "last_seen_frame": frame_count,
-                "last_speed_kmh": speed_kmh,
-                "released": False,
+                "current_route_exit": default_exit,
             }
             self.total_added += 1
-            # Return here — do NOT call _move_vehicle on the first spawn frame
-            # so the queue-aware spawn position is preserved.
             return True
 
-        # ---- Known active vehicle: pixel-track its position ----
-        sumo_id = f"veh_{object_id}"
+        # ---- Known active vehicle: check for turn detection ----
+        info = self.active_vehicles[object_id]
+        info["last_seen_frame"] = frame_count
 
-        mapping = self.edge_mapper.map_to_edge(px_cx, px_cy, current_region, entry_region)
-        if mapping is None:
-            # Vehicle is not in any known region — keep last_seen updated
-            self.active_vehicles[object_id]["last_seen_frame"] = frame_count
+        if current_region is not None and current_region != info["entry"]:
+            # Vehicle is now in a different region than where it entered.
+            # This means it turned! Update route if not already set.
+            if info["current_route_exit"] != current_region:
+                self._reroute_vehicle(info, current_region)
+
+        return True
+
+    def _spawn_vehicle(self, sumo_id, vehicle_class, entry_region):
+        """
+        Spawn a vehicle at the start of its entry edge with a default
+        straight-through route, then release it to SUMO's autonomous control.
+
+        The vehicle will drive itself with accel=1.5 m/s², maxSpeed=10 m/s.
+        """
+        vtype_id = f"vType_{vehicle_class}"
+
+        if entry_region in OPPOSITE_DIRECTION:
+            exit_region = OPPOSITE_DIRECTION[entry_region]
+        else:
+            entry_region = "north"
+            exit_region = "south"
+
+        route_id = f"route_{entry_region}_to_{exit_region}"
+
+        # Lane preferences: motorcycle=0 (inner), everything else=1 (outer)
+        preferred_lane = 0 if vehicle_class == "motorcycle" else 1
+
+        try:
+            traci.vehicle.add(
+                vehID=sumo_id,
+                routeID=route_id,
+                typeID=vtype_id,
+                depart="now",
+                departLane=str(preferred_lane),
+                departSpeed="max",
+                departPos="0.1",
+            )
+            # Let SUMO control the vehicle autonomously — no manual position control
+            # Default speedMode=31 and laneChangeMode=1621 are the SUMO defaults
+            # which handle car-following, right-of-way, etc.
+            traci.vehicle.setSpeedMode(sumo_id, 31)
+            traci.vehicle.setLaneChangeMode(sumo_id, 1621)
+            traci.vehicle.setSpeed(sumo_id, -1)  # -1 = SUMO controls speed
+
+            print(f"  [+] Spawned {sumo_id} ({vehicle_class}) on "
+                  f"{entry_region}_to_center, route={route_id}")
+            return True
+        except traci.exceptions.TraCIException as e:
+            print(f"  [!] Failed to add {sumo_id}: {e}")
             return False
 
-        edge_id, t_position = mapping
-        self._move_vehicle(sumo_id, edge_id, t_position, speed_kmh, vehicle_class)
-        self.active_vehicles[object_id]["last_seen_frame"] = frame_count
-        self.active_vehicles[object_id]["last_speed_kmh"] = speed_kmh
-        self.active_vehicles[object_id]["released"] = False
-        return True
+    def _reroute_vehicle(self, info, new_exit_region):
+        """
+        Change a vehicle's route when a turn is detected in the video.
+
+        The vehicle entered from info['entry'] and is now observed in
+        new_exit_region, so we change its SUMO route accordingly.
+        """
+        sumo_id = info["sumo_id"]
+        entry = info["entry"]
+        new_route_id = f"route_{entry}_to_{new_exit_region}"
+
+        if new_route_id not in ROUTE_DEFINITIONS:
+            return  # Invalid route combination
+
+        try:
+            # Build the edge list for the new route
+            new_edges = ROUTE_DEFINITIONS[new_route_id].split()
+            traci.vehicle.setRoute(sumo_id, new_edges)
+
+            old_exit = info["current_route_exit"]
+            info["current_route_exit"] = new_exit_region
+            self.total_rerouted += 1
+
+            print(f"  [↪] Rerouted {sumo_id}: "
+                  f"{entry}→{old_exit} => {entry}→{new_exit_region}")
+        except traci.exceptions.TraCIException as e:
+            print(f"  [!] Failed to reroute {sumo_id}: {e}")
 
     def cleanup_pending_vehicles(self, current_frame):
         """
@@ -438,244 +419,188 @@ class VehicleManager:
             del self.pending_vehicles[object_id]
             self.total_filtered += 1
 
-    def release_lost_vehicles(self, current_frame):
+    def cleanup_lost_vehicles(self, current_frame):
         """
-        When a vehicle hasn't been detected for LOST_VEHICLE_THRESHOLD frames,
-        release it to SUMO's autonomous driving at its last known speed.
-        The vehicle will continue driving and exit the network naturally.
+        Remove vehicles from tracking that haven't been detected for
+        LOST_VEHICLE_THRESHOLD frames. The vehicle continues to exist
+        in SUMO and drives itself out of the network autonomously.
         """
-        to_release = []
         to_cleanup = []
 
         for object_id, info in self.active_vehicles.items():
             frames_missing = current_frame - info["last_seen_frame"]
 
-            if frames_missing > LOST_VEHICLE_THRESHOLD and not info.get("released", False):
-                to_release.append(object_id)
-
-        for object_id in to_release:
-            info = self.active_vehicles[object_id]
-            sumo_id = info["sumo_id"]
-            last_speed = info.get("last_speed_kmh", DEFAULT_SPEED_KMH)
-
-            try:
-                # Re-enable SUMO's autonomous driving
-                traci.vehicle.setSpeedMode(sumo_id, 31)  # Default speed mode
-                traci.vehicle.setLaneChangeMode(sumo_id, 1621)  # Default lane change
-                traci.vehicle.setSpeed(sumo_id, -1)  # -1 = let SUMO control speed
-                traci.vehicle.setMaxSpeed(sumo_id, last_speed / 3.6)  # Set max speed
-
-                info["released"] = True
-                self.total_removed += 1
-                print(f"  [~] Released {sumo_id} to auto-drive at {last_speed:.1f} km/h")
-
-            except traci.exceptions.TraCIException:
-                # Vehicle already left the network
-                to_cleanup.append(object_id)
-
-        # Also check if released vehicles have left the network entirely
-        for object_id, info in list(self.active_vehicles.items()):
-            if info.get("released", False):
+            if frames_missing > LOST_VEHICLE_THRESHOLD:
                 sumo_id = info["sumo_id"]
                 try:
-                    # Check if vehicle still exists in simulation
+                    # Verify vehicle still exists in simulation
                     traci.vehicle.getPosition(sumo_id)
+                    # Vehicle is still driving — just stop tracking it
+                    self.total_removed += 1
+                    print(f"  [~] Released tracking of {sumo_id} "
+                          f"(still driving autonomously in SUMO)")
                 except traci.exceptions.TraCIException:
-                    to_cleanup.append(object_id)
+                    # Vehicle already left the network
+                    self.total_removed += 1
+                to_cleanup.append(object_id)
 
-        for object_id in set(to_cleanup):
-            if object_id in self.active_vehicles:
-                del self.active_vehicles[object_id]
+        for object_id in to_cleanup:
+            del self.active_vehicles[object_id]
 
-    def _add_vehicle(self, sumo_id, vehicle_class, entry_region, t_position):
-        """
-        Add a new vehicle to SUMO with a dynamic queue-aware spawn position.
 
-        Spawn strategy:
-          1. Uses the actual normalized camera position (t_position).
-          2. Checks existing vehicles on the route. Ensures new vehicles are 
-             placed behind the rearmost vehicle (end of the queue).
-          3. If the preferred lane's queue extends past QUEUE_TOO_LONG_THRESHOLD,
-             try the adjacent lane first (overflow logic).
-        """
-        vtype_id = f"vType_{vehicle_class}"
+# ============================================================
+# Threaded Pipeline Components
+# ============================================================
 
-        if entry_region and entry_region in OPPOSITE_DIRECTION:
-            exit_region = OPPOSITE_DIRECTION[entry_region]
-        else:
-            entry_region = "north"
-            exit_region = "south"
+class FrameReader:
+    """Background thread that decodes video frames into a queue."""
 
-        route_id = f"route_{entry_region}_to_{exit_region}"
-        edge_id  = f"{entry_region}_to_center"
+    def __init__(self, video_path, max_queue_size=2):
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Error opening video file: {video_path}")
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._frame_index = 0
+        self._total_skipped = 0
+        self._lock = threading.Lock()
+        self._wall_start = _time.monotonic()
+        self.max_skip_per_burst = 8
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
 
-        # Lane preferences: motorcycle=0 (inner), everything else=1 (outer)
-        preferred_lane = 0 if vehicle_class == "motorcycle" else 1
-        # Both lanes are eligible for overflow (motorcycle → car lane and vice-versa)
-        lanes_to_try = [preferred_lane, 1 - preferred_lane]
-
-        dims       = VTYPE_DIMENSIONS.get(vehicle_class, VTYPE_DIMENSIONS["car"])
-        veh_length = float(dims["length"])
-        veh_mingap = float(dims["minGap"])
-
-        # If the queue on the preferred lane reaches further than this from the
-        # edge start, consider the lane "too long" and try the adjacent one.
-        QUEUE_TOO_LONG_THRESHOLD = 50.0
-
-        def _safe_spawn_pos(lane_id):
-            """Return (safe_pos, lane_length) or (None, None) on TraCI error."""
+    def _reader_loop(self):
+        while not self._stop_event.is_set():
+            with self._lock:
+                wall_elapsed = _time.monotonic() - self._wall_start
+                expected_frame = int(wall_elapsed * self.fps)
+                frames_behind = expected_frame - self._frame_index
+                if frames_behind > 1:
+                    skip_n = min(frames_behind - 1, self.max_skip_per_burst)
+                    for _ in range(skip_n):
+                        if not self.cap.grab():
+                            break
+                        self._frame_index += 1
+                        self._total_skipped += 1
+                ret, frame = self.cap.read()
+                if not ret:
+                    self._queue.put(None)
+                    return
+                self._frame_index += 1
+                idx = self._frame_index
             try:
-                lane_len = traci.lane.getLength(lane_id)
-            except traci.exceptions.TraCIException:
-                return None, None
-
-            mapped_pos = t_position * lane_len
-
-            try:
-                veh_ids = traci.lane.getLastStepVehicleIDs(lane_id)
-            except traci.exceptions.TraCIException:
-                veh_ids = []
-
-            occupied = []
-            for vid in veh_ids:
-                try:
-                    front = traci.vehicle.getLanePosition(vid)
-                    vlen  = traci.vehicle.getLength(vid)
-                    occupied.append(front - vlen)
-                except traci.exceptions.TraCIException:
-                    pass
-
-            if occupied:
-                last_rear = min(occupied)
-                # Cap the spawn position to be behind the queue, 
-                # but don't place it ahead of the actual camera-mapped position.
-                safe = min(mapped_pos, last_rear - veh_mingap - veh_length)
-            else:
-                safe = mapped_pos
-
-            safe = max(0.1, min(safe, lane_len - 0.1))
-            return safe, lane_len
-
-        chosen_lane = None
-        chosen_pos  = None
-        fallback    = None  # (lane_idx, pos) if all lanes are too congested
-
-        for lane_idx in lanes_to_try:
-            lane_id = f"{edge_id}_{lane_idx}"
-            pos, _  = _safe_spawn_pos(lane_id)
-            if pos is None:
+                self._queue.put((idx, frame), timeout=1.0)
+            except queue.Full:
+                if self._stop_event.is_set():
+                    return
                 continue
 
-            if pos >= QUEUE_TOO_LONG_THRESHOLD:
-                # Queue is short enough on this lane — use it
-                chosen_lane = lane_idx
-                chosen_pos  = pos
-                break
-            else:
-                # Queue is long; remember as fallback, try the adjacent lane
-                if fallback is None:
-                    fallback = (lane_idx, pos)
-
-        if chosen_lane is None:
-            # All lanes congested — use the least-backed-up one as fallback
-            if fallback is not None:
-                chosen_lane, chosen_pos = fallback
-            else:
-                chosen_lane = preferred_lane
-                chosen_pos  = 1.0  # Last resort: very start of edge
-
-        lane_id = f"{edge_id}_{chosen_lane}"
-
+    def read(self):
         try:
-            traci.vehicle.add(
-                vehID=sumo_id,
-                routeID=route_id,
-                typeID=vtype_id,
-                depart="now",
-                departSpeed="7",
-            )
-            # Disable SUMO's autonomous driving — position is fixed by moveTo
-            traci.vehicle.setSpeedMode(sumo_id, 0)
-            traci.vehicle.setLaneChangeMode(sumo_id, 0)
-            traci.vehicle.setSpeed(sumo_id, 7.0)
+            return self._queue.get(timeout=2.0)
+        except queue.Empty:
+            return None
 
-            # Hard-place the vehicle at the queue-aware spawn position
-            traci.vehicle.moveTo(sumo_id, lane_id, chosen_pos)
+    @property
+    def frame_index(self):
+        with self._lock:
+            return self._frame_index
 
-            print(f"  [+] Spawned {sumo_id} ({vehicle_class}) on "
-                  f"{lane_id} at pos={chosen_pos:.1f} m "
-                  f"({'preferred' if chosen_lane == preferred_lane else 'overflow'} lane)")
-            return True
-        except traci.exceptions.TraCIException as e:
-            print(f"  [!] Failed to add {sumo_id}: {e}")
-            return False
+    @property
+    def total_skipped(self):
+        with self._lock:
+            return self._total_skipped
 
-    def _move_vehicle(self, sumo_id, edge_id, t_position, speed_kmh, vehicle_class):
-        """
-        Place a vehicle directly on a lane at a specific position.
-        Uses traci.vehicle.moveTo() which is impossible to go off-road.
-
-        Lane assignment:
-          - motorcycle → lane 0 (inside)
-          - car/bus/truck → lane 1 (outside)
-
-        :param sumo_id: Vehicle ID in SUMO
-        :param edge_id: Target edge (e.g. 'north_to_center')
-        :param t_position: Normalized position along edge (0.0 = start, 1.0 = end)
-        :param speed_kmh: Speed in km/h
-        :param vehicle_class: 'car', 'motorcycle', 'bus', 'truck'
-        """
-        try:
-            # Lane 0 = inside (motorcycle), Lane 1 = outside (car/bus/truck)
-            lane_index = 0 if vehicle_class == "motorcycle" else 1
-            lane_id = f"{edge_id}_{lane_index}"
-
-            # Get the lane length and compute absolute position in meters
-            lane_length = traci.lane.getLength(lane_id)
-            pos = t_position * lane_length
-            pos = max(0.1, min(pos, lane_length - 0.1))  # Stay inside the lane
-
-            # moveTo places the vehicle EXACTLY on the lane — cannot be off-road
-            traci.vehicle.moveTo(sumo_id, lane_id, pos)
-
-            # Set speed to match detected speed
-            speed_ms = max(speed_kmh / 3.6, 0.1)
-            traci.vehicle.setSpeed(sumo_id, speed_ms)
-
-        except traci.exceptions.TraCIException:
-            # Vehicle may have been removed by SUMO
-            pass
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=3.0)
+        self.cap.release()
 
 
-# ============================================================
-# Main Real-Time Processing Loop
-# ============================================================
+class TraCIWorker:
+    """
+    Background thread for all SUMO/TraCI communication.
+    Main thread queues commands; this thread executes them serially,
+    hiding ~5-10ms IPC latency behind the next YOLO inference.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=64)
+        self._stop_event = threading.Event()
+        self._error = None
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                cmd = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if cmd is None:
+                return
+            try:
+                cmd()
+            except traci.exceptions.TraCIException as e:
+                self._error = e
+
+    def submit(self, fn):
+        """Queue a callable to be executed on the TraCI thread."""
+        self._queue.put(fn)
+
+    def flush(self):
+        """Wait until all queued commands are processed."""
+        self._queue.join() if hasattr(self._queue, 'join') else None
+
+    @property
+    def error(self):
+        return self._error
+
+    def stop(self):
+        self._stop_event.set()
+        self._queue.put(None)
+        self._thread.join(timeout=3.0)
+
 
 def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None):
     """
-    Main real-time processing loop:
-    1. Open video & set up SUMO network
-    2. Start SUMO via TraCI
-    3. For each frame: detect vehicles → map positions → update SUMO
-    4. Cleanup on exit
+    3-thread real-time pipeline:
+      Thread 1 (FrameReader):  CPU video decode → queue
+      Thread 2 (Main):         YOLO inference (GPU) + detection processing
+      Thread 3 (TraCIWorker):  SUMO IPC (spawn, reroute, simulationStep)
+
+    Plus: YOLO runs every 2nd frame (INFER_STRIDE=2) to halve GPU load.
+    On non-inference frames, only SUMO time is advanced.
     """
 
     # --- Load YOLO model ---
-    model_name = "model/yolo11x.pt"
+    # Prefer TensorRT engine if available (3-5× faster), fall back to .pt
+    engine_path = "model/yolo11x.engine"
+    pt_path = "model/yolo11x.pt"
+    if os.path.exists(engine_path):
+        model_name = engine_path
+        print(f"Using TensorRT engine: {engine_path} (optimized for this GPU)")
+    else:
+        model_name = pt_path
+        print(f"Using PyTorch model: {pt_path}")
+        print("  TIP: Export to TensorRT for 3-5× speedup:")
+        print(f'       python -c "from ultralytics import YOLO; YOLO(\'{pt_path}\').export(format=\'engine\', half=True, imgsz=960)"')
     model = YOLO(model_name)
     model.verbose = False
 
-    # --- Open video ---
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Error opening video file: {video_path}")
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    # --- Start threaded frame reader ---
+    reader = FrameReader(video_path, max_queue_size=2)
+    fps = reader.fps
+    width = reader.width
+    height = reader.height
     step_length = 1.0 / fps
 
     print(f"Video: {width}x{height} @ {fps:.2f} FPS (step_length={step_length:.4f}s)")
+    print(f"Pipeline: Threaded reader (queue=2) + main inference loop")
 
     # --- Setup SUMO network ---
     setup_sumo_network(output_dir)
@@ -698,200 +623,204 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
     regions = load_regions_from_json("regions.json")
     if regions is None:
         print("ERROR: Could not load regions.json")
+        reader.stop()
         traci.close()
         return
 
-    # --- Create edge position mapper ---
-    edge_mapper = EdgePositionMapper()
-    vehicle_mgr = VehicleManager(edge_mapper)
+    # --- Create vehicle manager (spawn-and-release + turn detection) ---
+    vehicle_mgr = VehicleManager()
+
+    # --- Start async TraCI worker ---
+    traci_worker = TraCIWorker()
 
     # --- Tracking state ---
     track_data = {}  # object_id -> list of (frame, cx, cy, speed, label, entry, region)
-    frame_count = 0          # next frame index to read from video
     processed_count = 0      # frames actually run through YOLO
-    total_skipped = 0        # cumulative skipped frames
+    infer_count = 0          # frames that actually ran YOLO
 
-    # Maximum frames to skip in one burst to avoid huge jumps
-    MAX_SKIP_PER_BURST = 10
+    # Only run YOLO every INFER_STRIDE frames — biggest perf win
+    INFER_STRIDE = 2
+
+    # Display every N processed frames
+    DISPLAY_INTERVAL = 10
+
+    # Cleanup SUMO stale vehicles every N frames
+    CLEANUP_INTERVAL = 30
 
     # --- Process video with YOLO ---
     print("\n=== Starting real-time digital twin ===")
+    print(f"Pipeline: reader thread + YOLO(stride={INFER_STRIDE}) + async TraCI")
     print("Press 'q' in the OpenCV window to stop.\n")
 
-    import time as _time
-    wall_start = _time.monotonic()  # wall-clock start reference
+    wall_start = reader._wall_start
+    t_infer_ms = 0.0
 
     try:
         while True:
-            # ----------------------------------------------------------------
-            # Frame-skip logic: compare wall-clock time to video playback time.
-            # If we are behind real-time, skip frames to catch up.
-            # ----------------------------------------------------------------
-            wall_elapsed = _time.monotonic() - wall_start
-            expected_frame = int(wall_elapsed * fps)  # frame index we SHOULD be at
-            frames_behind = expected_frame - frame_count
-
-            if frames_behind > 1:
-                skip_n = min(frames_behind - 1, MAX_SKIP_PER_BURST)
-                # Read & discard skip_n frames
-                for _ in range(skip_n):
-                    ret_skip = cap.grab()  # grab without decode — fast
-                    if not ret_skip:
-                        break
-                    frame_count += 1
-                    total_skipped += 1
-
-                video_time_at_skip = frame_count / fps
-                print(
-                    f"[FRAME-SKIP] t={video_time_at_skip:.2f}s | "
-                    f"skipped {skip_n} frame(s) | "
-                    f"total skipped so far: {total_skipped} | "
-                    f"wall={wall_elapsed:.2f}s"
-                )
-
-            # Read the next frame for processing
-            ret, frame = cap.read()
-            if not ret:
+            # --- Pull next pre-decoded frame from reader thread ---
+            item = reader.read()
+            if item is None:
                 print("End of video.")
                 break
-            frame_count += 1
+
+            frame_count, frame = item
             processed_count += 1
             current_time = frame_count / fps
 
-            # Run YOLO tracking on this frame
-            results_list = model.track(
-                source=frame,
-                imgsz=1920,
-                conf=0.4,
-                show=False,
-                stream=False,
-                verbose=False,
-                persist=True,
-                tracker="botsort.yaml",
-            )
-            results = results_list[0] if results_list else None
+            # --- Run YOLO only on stride frames (every Nth) ---
+            run_yolo = (processed_count % INFER_STRIDE == 0)
 
-            display_frame = frame.copy()
+            if run_yolo:
+                infer_count += 1
+                t_infer_start = _time.monotonic()
+                results_list = model.track(
+                    source=frame,
+                    imgsz=960,
+                    conf=0.4,
+                    half=True,
+                    show=False,
+                    stream=False,
+                    verbose=False,
+                    persist=True,
+                    tracker="botsort.yaml",
+                )
+                results = results_list[0] if results_list else None
+                t_infer_ms = (_time.monotonic() - t_infer_start) * 1000
 
-            # Draw region overlays
-            draw_polygonal_region(display_frame, regions)
+                # --- Decide if we should render display this frame ---
+                should_display = (infer_count % (DISPLAY_INTERVAL // INFER_STRIDE or 1) == 0)
+                if should_display:
+                    display_frame = frame.copy()
+                    draw_polygonal_region(display_frame, regions)
 
-            if results is not None:
-                # --- Process each detected vehicle ---
-                for box in results.boxes:
-                    if box.id is None:
-                        continue
+                if results is not None:
+                    for box in results.boxes:
+                        if box.id is None:
+                            continue
+                        object_id = int(box.id[0])
+                        cls = int(box.cls[0])
+                        label = model.names[cls]
+                        if cls not in TRACKED_CLASS_IDS:
+                            continue
 
-                    object_id = int(box.id[0])
-                    cls = int(box.cls[0])
-                    label = model.names[cls]
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        cx = (x1 + x2) / 2
+                        cy = (y1 + y2) / 2
+                        region = detect_region(cx, cy, regions)
 
-                    if cls not in TRACKED_CLASS_IDS:
-                        continue
-
-                    # Bounding box center
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cx = (x1 + x2) / 2
-                    cy = (y1 + y2) / 2
-
-                    # Detect which region this vehicle is in
-                    region = detect_region(cx, cy, regions)
-
-                    # --- Calculate speed ---
-                    if object_id not in track_data:
-                        speed = 0.0
-                        entry_point = region
-                    else:
-                        last_frame, last_cx, last_cy, last_speed, *_ = track_data[object_id][-1]
-                        frame_diff = frame_count - last_frame
-                        if frame_diff > 0:
-                            meters_per_pixel = 50 / 1420
-                            distance_px = math.hypot(cx - last_cx, cy - last_cy)
-                            distance_m = distance_px * meters_per_pixel
-                            time_sec = frame_diff / fps
-                            speed = (distance_m / time_sec) * 3.6
+                        if object_id not in track_data:
+                            speed = 0.0
+                            entry_point = region
                         else:
-                            speed = last_speed
-                        entry_point = None
+                            last_frame, last_cx, last_cy, last_speed, *_ = track_data[object_id][-1]
+                            frame_diff = frame_count - last_frame
+                            if frame_diff > 0:
+                                meters_per_pixel = 50 / 1420
+                                distance_px = math.hypot(cx - last_cx, cy - last_cy)
+                                distance_m = distance_px * meters_per_pixel
+                                time_sec = frame_diff / fps
+                                speed = (distance_m / time_sec) * 3.6
+                            else:
+                                speed = last_speed
+                            entry_point = None
 
-                    # Store tracking data
-                    track_data.setdefault(object_id, []).append(
-                        (frame_count, cx, cy, speed, label, entry_point, region)
-                    )
+                        track_data.setdefault(object_id, []).append(
+                            (frame_count, cx, cy, speed, label, entry_point, region)
+                        )
 
-                    # Determine vehicle class and entry region
-                    vehicle_class = VEHICLE_CLASSES.get(cls, "car")
-                    effective_entry = entry_point if entry_point else (
-                        track_data[object_id][0][5] if track_data[object_id] else None
-                    )
+                        vehicle_class = VEHICLE_CLASSES.get(cls, "car")
+                        effective_entry = entry_point if entry_point else (
+                            track_data[object_id][0][5] if track_data[object_id] else None
+                        )
 
-                    # --- Update vehicle position in SUMO ---
-                    vehicle_mgr.update_vehicle(
-                        object_id=object_id,
-                        px_cx=cx,
-                        px_cy=cy,
-                        speed_kmh=speed if speed > 0 else DEFAULT_SPEED_KMH,
-                        vehicle_class=vehicle_class,
-                        entry_region=effective_entry,
-                        current_region=region,
-                        frame_count=frame_count,
-                    )
+                        vehicle_mgr.update_vehicle(
+                            object_id=object_id,
+                            px_cx=cx,
+                            px_cy=cy,
+                            vehicle_class=vehicle_class,
+                            entry_region=effective_entry,
+                            current_region=region,
+                            frame_count=frame_count,
+                        )
 
-                    # --- Draw on frame ---
-                    in_sumo = "◉" if object_id in vehicle_mgr.active_vehicles else ""
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(
-                        display_frame,
-                        f"ID:{object_id} {label} {speed:.1f}km/h {in_sumo}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 255, 0), 2,
-                    )
+                        if should_display:
+                            in_sumo = "◉" if object_id in vehicle_mgr.active_vehicles else ""
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.putText(
+                                display_frame,
+                                f"ID:{object_id} {label} {speed:.1f}km/h {in_sumo}",
+                                (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (0, 255, 0), 2,
+                            )
 
-            # --- Release vehicles that left the camera to auto-drive ---
-            vehicle_mgr.release_lost_vehicles(frame_count)
-            vehicle_mgr.cleanup_pending_vehicles(frame_count)
+                # --- Cleanup vehicles (batched) ---
+                if infer_count % CLEANUP_INTERVAL == 0:
+                    vehicle_mgr.cleanup_lost_vehicles(frame_count)
+                    vehicle_mgr.cleanup_pending_vehicles(frame_count)
+            else:
+                should_display = False
 
-            # --- Advance SUMO simulation to match video time ---
-            try:
-                traci.simulationStep(current_time)
-            except traci.exceptions.TraCIException as e:
-                print(f"TraCI simulation step error: {e}")
+            # --- Advance SUMO (async on TraCI thread) ---
+            step_time = current_time
+            traci_worker.submit(lambda t=step_time: traci.simulationStep(t))
+
+            if traci_worker.error:
+                print(f"TraCI error: {traci_worker.error}")
                 break
 
-            # --- HUD overlay ---
-            active_count = len(vehicle_mgr.active_vehicles)
-            cv2.putText(
-                display_frame,
-                f"Frame: {frame_count} | Time: {current_time:.1f}s | "
-                f"Active in SUMO: {active_count} | Total added: {vehicle_mgr.total_added} | "
-                f"Skipped: {total_skipped}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (255, 255, 255), 2,
-            )
-
-            cv2.imshow("Real-Time Traffic Digital Twin", display_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("\nUser pressed 'q' — stopping.")
-                break
+            # --- HUD overlay & display (only on display frames) ---
+            if should_display:
+                total_skipped = reader.total_skipped
+                active_count = len(vehicle_mgr.active_vehicles)
+                effective_fps = 1000.0 / t_infer_ms if t_infer_ms > 0 else 0
+                wall_elapsed = _time.monotonic() - wall_start
+                avg_skip_per_sec = total_skipped / wall_elapsed if wall_elapsed > 0 else 0
+                cv2.putText(
+                    display_frame,
+                    f"Frame: {frame_count} | Time: {current_time:.1f}s | "
+                    f"YOLO: {t_infer_ms:.0f}ms ({effective_fps:.1f} FPS) | "
+                    f"Skipped: {total_skipped} ({avg_skip_per_sec:.1f}/s)",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 2,
+                )
+                cv2.putText(
+                    display_frame,
+                    f"Active: {active_count} | Added: {vehicle_mgr.total_added} | "
+                    f"Rerouted: {vehicle_mgr.total_rerouted}",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 2,
+                )
+                cv2.imshow("Real-Time Traffic Digital Twin", display_frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("\nUser pressed 'q' — stopping.")
+                    break
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
 
     finally:
+        total_skipped = reader.total_skipped
+        reader.stop()
+        traci_worker.stop()
+
+        total_wall = _time.monotonic() - wall_start
+        avg_skip = total_skipped / total_wall if total_wall > 0 else 0
         print(f"\n=== Session Summary ===")
-        print(f"Frames read (video):  {frame_count}")
+        print(f"Frames read (video):  {reader.frame_index}")
         print(f"Frames processed:    {processed_count}")
-        print(f"Frames skipped:      {total_skipped}")
+        print(f"YOLO inferences:     {infer_count}")
+        print(f"Frames skipped:      {total_skipped} (avg {avg_skip:.1f}/s)")
         print(f"Vehicles added:      {vehicle_mgr.total_added}")
         print(f"Vehicles released:   {vehicle_mgr.total_removed}")
+        print(f"Vehicles rerouted:   {vehicle_mgr.total_rerouted}")
         print(f"Parked filtered:     {vehicle_mgr.total_filtered}")
         print(f"Still active:        {len(vehicle_mgr.active_vehicles)}")
         print(f"Still pending:       {len(vehicle_mgr.pending_vehicles)}")
         print(f"Total tracked:       {len(track_data)}")
 
-        cap.release()
         cv2.destroyAllWindows()
         try:
             traci.close()

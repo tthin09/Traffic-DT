@@ -16,10 +16,10 @@ proximity_thresh: 0.5       # Spatial proximity threshold
 appearance_thresh: 0.25     # ReID appearance threshold
 
 # Global Motion Compensation
-gmc_method: sparseOptFlow   # Options: orb, sift, ecc, sparseOptFlow, none
+gmc_method: none            # Camera is stationary — no motion to compensate
 
 # ReID model
 with_reid: false            # Use ReID features (set to true if you have ReID model)
 
 # Camera motion compensation
-cmc_method: sparseOptFlow   # CMC method for motion compensation
+cmc_method: none            # Camera is stationary — disabled for performance
