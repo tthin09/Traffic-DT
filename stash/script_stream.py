@@ -21,10 +21,10 @@ skip_frame = False
 def generate_nod_file(output_file):
     root = ET.Element("nodes")
     ET.SubElement(root, "node", id="center", x="0", y="0", type="traffic_light") # Center
-    ET.SubElement(root, "node", id="n1", x="0", y="100", type="priority") # North
-    ET.SubElement(root, "node", id="n2", x="100", y="0", type="priority") # East
-    ET.SubElement(root, "node", id="n3", x="0", y="-100", type="priority") # South
-    ET.SubElement(root, "node", id="n4", x="-100", y="0", type="priority") # West
+    ET.SubElement(root, "node", id="n1", x="0", y="25", type="priority") # North
+    ET.SubElement(root, "node", id="n2", x="25", y="0", type="priority") # East
+    ET.SubElement(root, "node", id="n3", x="0", y="-25", type="priority") # South
+    ET.SubElement(root, "node", id="n4", x="-25", y="0", type="priority") # West
     tree = ET.ElementTree(root)
     tree.write(output_file, encoding="utf-8", xml_declaration=True)
 

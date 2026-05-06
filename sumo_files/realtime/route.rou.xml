@@ -1,9 +1,9 @@
 <?xml version='1.0' encoding='utf-8'?>
 <routes>
-    <vType id="vType_motorcycle" maxSpeed="10.0" length="2.2" width="0.8" minGap="0.5" minGapLat="0.3" maxSpeedLat="1.0" latAlignment="center" accel="1.5" decel="6.0" sigma="0.5" guiShape="motorcycle" />
-    <vType id="vType_car" maxSpeed="10.0" length="4.5" width="1.8" minGap="2.0" minGapLat="0.6" maxSpeedLat="0.5" latAlignment="center" accel="1.5" decel="5.0" sigma="0.5" guiShape="passenger" />
-    <vType id="vType_bus" maxSpeed="10.0" length="12.0" width="2.5" minGap="2.5" minGapLat="0.8" maxSpeedLat="0.3" latAlignment="center" accel="1.5" decel="4.0" sigma="0.5" guiShape="bus" />
-    <vType id="vType_truck" maxSpeed="10.0" length="8.0" width="2.3" minGap="2.5" minGapLat="0.7" maxSpeedLat="0.4" latAlignment="center" accel="1.5" decel="4.5" sigma="0.5" guiShape="truck" />
+    <vType id="vType_motorcycle" maxSpeed="15.0" length="2.2" width="0.8" minGap="0.5" minGapLat="0.3" maxSpeedLat="1.0" latAlignment="center" accel="2" decel="6.0" sigma="0.5" guiShape="motorcycle" />
+    <vType id="vType_car" maxSpeed="15.0" length="4.5" width="1.8" minGap="2.0" minGapLat="0.6" maxSpeedLat="0.5" latAlignment="center" accel="1.5" decel="5.0" sigma="0.5" guiShape="passenger" />
+    <vType id="vType_bus" maxSpeed="15.0" length="12.0" width="2.5" minGap="2.5" minGapLat="0.8" maxSpeedLat="0.3" latAlignment="center" accel="1.5" decel="4.0" sigma="0.5" guiShape="bus" />
+    <vType id="vType_truck" maxSpeed="15.0" length="8.0" width="2.3" minGap="2.5" minGapLat="0.7" maxSpeedLat="0.4" latAlignment="center" accel="1.5" decel="4.5" sigma="0.5" guiShape="truck" />
     <route id="route_north_to_south" edges="north_to_center center_to_south" />
     <route id="route_south_to_north" edges="south_to_center center_to_north" />
     <route id="route_east_to_west" edges="east_to_center center_to_west" />

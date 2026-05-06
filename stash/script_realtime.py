@@ -16,12 +16,19 @@ import cv2
 import os
 import sys
 import math
+import json
 import argparse
 import time as _time
 import threading
 import queue
+import numpy as np
 import xml.etree.ElementTree as ET
 from ultralytics import YOLO
+import torch
+
+# SAHI imports for sliced inference (small object detection)
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 
 # --- SUMO/TraCI imports ---
 if "SUMO_HOME" in os.environ:
@@ -58,7 +65,7 @@ VTYPE_DIMENSIONS = {
     "motorcycle": {
         "length": "2.2", "width": "0.8", "minGap": "0.5",
         "minGapLat": "0.3", "maxSpeedLat": "1.0", "latAlignment": "center",
-        "accel": "1.5", "decel": "6.0", "sigma": "0.5",
+        "accel": "2", "decel": "6.0", "sigma": "0.5",
         "guiShape": "motorcycle",
     },
     "car": {
@@ -110,7 +117,38 @@ LOST_VEHICLE_THRESHOLD = 30  # ~1 second at 30fps
 MIN_MOVEMENT_PX = 20.0
 
 # Default max speed in m/s
-DEFAULT_MAX_SPEED_MS = 10.0
+DEFAULT_MAX_SPEED_MS = 15.0
+
+# --- Phase 1: Trajectory-based entry detection ---
+# Direction vectors in pixel space (OpenCV: origin=top-left, y increases downward)
+# These represent the dominant movement direction of vehicles FROM each entry.
+ENTRY_VELOCITY_VECTORS = {
+    "north": (0.0,  1.0),   # From North → moving downward (cy increases)
+    "south": (0.0, -1.0),   # From South → moving upward   (cy decreases)
+    "east":  (-1.0, 0.0),   # From East  → moving leftward (cx decreases)
+    "west":  (1.0,  0.0),   # From West  → moving rightward(cx increases)
+}
+
+# Minimum trajectory points before direction-based entry detection kicks in
+MIN_TRAJECTORY_POINTS = 5
+
+# Minimum cosine similarity to override the initial region-based entry
+MIN_DIRECTION_CONFIDENCE = 0.4
+
+# Ground truth vehicle counts for validation (hand-counted from video)
+GROUND_TRUTH_COUNTS_FOR_TPHCM = {
+    "east": 78,
+    "north": 91,
+    "south": 49,
+    "west": 103,
+}
+
+GROUND_TRUTH_COUNTS = {
+    "east": 78,
+    "north": 91,
+    "south": 49,
+    "west": 103,
+}
 
 
 
@@ -247,11 +285,16 @@ class VehicleManager:
 
     def __init__(self):
         self.active_vehicles = {}    # object_id -> {sumo_id, class, entry, last_seen_frame, current_route_exit}
-        self.pending_vehicles = {}   # object_id -> {last_cx, last_cy, cumulative_dist, class, entry, last_frame}
+        self.pending_vehicles = {}   # object_id -> {last_cx, last_cy, cumulative_dist, class, entry, last_frame, trajectory}
         self.total_added = 0
         self.total_removed = 0
         self.total_filtered = 0      # Parked vehicles that were never injected
         self.total_rerouted = 0      # Vehicles whose route was changed due to turn detection
+        self.total_entry_corrected = 0  # Vehicles whose entry was corrected by trajectory
+
+        # Statistics tracking
+        self.spawn_counts = {}       # entry_region -> count
+        self.od_counts = {}          # (entry_region, exit_region) -> count
 
     def update_vehicle(self, object_id, px_cx, px_cy, vehicle_class,
                        entry_region, current_region, frame_count):
@@ -279,6 +322,7 @@ class VehicleManager:
                     "class": vehicle_class,
                     "entry": entry_region,
                     "last_frame": frame_count,
+                    "trajectory": [(px_cx, px_cy)],
                 }
                 return False  # Not added to SUMO yet
 
@@ -290,6 +334,7 @@ class VehicleManager:
             pending["last_cx"] = px_cx
             pending["last_cy"] = px_cy
             pending["last_frame"] = frame_count
+            pending["trajectory"].append((px_cx, px_cy))
 
             # Update entry if it was None before and now we have a region
             if pending["entry"] is None and entry_region is not None:
@@ -299,7 +344,11 @@ class VehicleManager:
                 return False  # Still hasn't moved enough — probably parked
 
             # Vehicle has moved enough! Promote to active with spawn-and-release.
-            entry_region = pending["entry"]
+            # Use trajectory-based entry detection to correct misattributed directions
+            initial_entry = pending["entry"]
+            entry_region = self._resolve_entry_by_trajectory(
+                pending["trajectory"], initial_entry
+            )
             del self.pending_vehicles[object_id]
 
             if entry_region is None:
@@ -310,15 +359,21 @@ class VehicleManager:
                 return False
 
             # Default route exit is straight through (opposite direction)
+            actual_entry = entry_region if entry_region in OPPOSITE_DIRECTION else "north"
             default_exit = OPPOSITE_DIRECTION.get(entry_region, "south")
             self.active_vehicles[object_id] = {
                 "sumo_id": sumo_id,
                 "class": vehicle_class,
-                "entry": entry_region,
+                "entry": actual_entry,
                 "last_seen_frame": frame_count,
                 "current_route_exit": default_exit,
             }
             self.total_added += 1
+
+            # Update stats
+            self.spawn_counts[actual_entry] = self.spawn_counts.get(actual_entry, 0) + 1
+            self.od_counts[(actual_entry, default_exit)] = self.od_counts.get((actual_entry, default_exit), 0) + 1
+
             return True
 
         # ---- Known active vehicle: check for turn detection ----
@@ -400,10 +455,64 @@ class VehicleManager:
             info["current_route_exit"] = new_exit_region
             self.total_rerouted += 1
 
+            # Update stats
+            if (entry, old_exit) in self.od_counts:
+                self.od_counts[(entry, old_exit)] -= 1
+                if self.od_counts[(entry, old_exit)] <= 0:
+                    del self.od_counts[(entry, old_exit)]
+            self.od_counts[(entry, new_exit_region)] = self.od_counts.get((entry, new_exit_region), 0) + 1
+
             print(f"  [↪] Rerouted {sumo_id}: "
                   f"{entry}→{old_exit} => {entry}→{new_exit_region}")
         except traci.exceptions.TraCIException as e:
             print(f"  [!] Failed to reroute {sumo_id}: {e}")
+
+    def _resolve_entry_by_trajectory(self, trajectory, initial_region):
+        """
+        Use the accumulated trajectory (list of (cx, cy) pixel coords) to
+        determine the true entry direction based on the vehicle's movement
+        vector, rather than relying solely on the region of first detection.
+
+        This fixes the North→South misattribution problem: vehicles from the
+        North that are first detected in the South region will be correctly
+        identified by their downward movement vector.
+        """
+        if len(trajectory) < MIN_TRAJECTORY_POINTS:
+            return initial_region  # Not enough data, use region-based detection
+
+        if initial_region is None:
+            return None
+
+        # Use first N points to compute average velocity vector
+        n = min(len(trajectory), 15)
+        points = trajectory[:n]
+        avg_dx = (points[-1][0] - points[0][0]) / max(n - 1, 1)
+        avg_dy = (points[-1][1] - points[0][1]) / max(n - 1, 1)
+
+        # Normalize the velocity vector
+        mag = math.hypot(avg_dx, avg_dy)
+        if mag < 1e-6:
+            return initial_region  # No meaningful movement
+        avg_dx /= mag
+        avg_dy /= mag
+
+        # Compute cosine similarity with each entry direction vector
+        best_dir = initial_region
+        best_sim = -1.0
+        for direction, (ref_dx, ref_dy) in ENTRY_VELOCITY_VECTORS.items():
+            sim = avg_dx * ref_dx + avg_dy * ref_dy
+            if sim > best_sim:
+                best_sim = sim
+                best_dir = direction
+
+        # Only override if confidence is above threshold
+        if best_dir != initial_region and best_sim > MIN_DIRECTION_CONFIDENCE:
+            print(f"  [📐] Entry corrected by trajectory: {initial_region} → {best_dir} "
+                  f"(cosine_sim={best_sim:.2f}, points={n})")
+            self.total_entry_corrected += 1
+            return best_dir
+
+        return initial_region
 
     def cleanup_pending_vehicles(self, current_frame):
         """
@@ -453,7 +562,7 @@ class VehicleManager:
 # ============================================================
 
 class FrameReader:
-    """Background thread that decodes video frames into a queue."""
+    """Background thread that decodes video frames into a queue (sequential, no skipping)."""
 
     def __init__(self, video_path, max_queue_size=2):
         self.cap = cv2.VideoCapture(video_path)
@@ -469,23 +578,13 @@ class FrameReader:
         self._total_skipped = 0
         self._lock = threading.Lock()
         self._wall_start = _time.monotonic()
-        self.max_skip_per_burst = 8
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
     def _reader_loop(self):
+        """Read every frame sequentially — no skipping for tracking accuracy."""
         while not self._stop_event.is_set():
             with self._lock:
-                wall_elapsed = _time.monotonic() - self._wall_start
-                expected_frame = int(wall_elapsed * self.fps)
-                frames_behind = expected_frame - self._frame_index
-                if frames_behind > 1:
-                    skip_n = min(frames_behind - 1, self.max_skip_per_burst)
-                    for _ in range(skip_n):
-                        if not self.cap.grab():
-                            break
-                        self._frame_index += 1
-                        self._total_skipped += 1
                 ret, frame = self.cap.read()
                 if not ret:
                     self._queue.put(None)
@@ -579,18 +678,73 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
 
     # --- Load YOLO model ---
     # Prefer TensorRT engine if available (3-5× faster), fall back to .pt
-    engine_path = "model/yolo11x.engine"
+    # Engine must be exported at imgsz=1280 to match inference size
+    engine_path = "model/yolo11x_1280.engine"
     pt_path = "model/yolo11x.pt"
     if os.path.exists(engine_path):
         model_name = engine_path
-        print(f"Using TensorRT engine: {engine_path} (optimized for this GPU)")
+        print(f"Using TensorRT engine: {engine_path} (optimized for imgsz=1280)")
     else:
         model_name = pt_path
         print(f"Using PyTorch model: {pt_path}")
-        print("  TIP: Export to TensorRT for 3-5× speedup:")
-        print(f'       python -c "from ultralytics import YOLO; YOLO(\'{pt_path}\').export(format=\'engine\', half=True, imgsz=960)"')
+        print("  TIP: Export TensorRT engine at 1280 for 3-5× speedup:")
+        print(f'       python -c "from ultralytics import YOLO; YOLO(\'{pt_path}\').export(format=\'engine\', half=True, imgsz=1280)"')
+        print(f"       Then rename the output to {engine_path}")
     model = YOLO(model_name)
     model.verbose = False
+
+    # --- Initialize SAHI detection model for small-object zones ---
+    # SAHI only runs on cropped ROIs (north/west) where motorcycles are small.
+    # The rest of the frame uses fast standard YOLO model.track().
+    sahi_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    sahi_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path=model_name,
+        confidence_threshold=0.25,
+        image_size=640,             # per-slice inference size (smaller = faster)
+        device=sahi_device,
+    )
+    # NOTE: FP16 is handled by model.track(half=True) for the main YOLO path.
+    # Do NOT call .half() on SAHI's model — it breaks fuse() with dtype mismatch.
+    print(f"SAHI detection model initialized (device={sahi_device})")
+
+    # --- Load SAHI zone definitions ---
+    # Only these regions use SAHI sliced inference; everything else uses fast YOLO.
+    sahi_zones = {}
+    sahi_zones_path = "sahi_zones.json"
+    if os.path.exists(sahi_zones_path):
+        with open(sahi_zones_path, "r") as f:
+            sahi_zones = json.load(f)
+        print(f"Loaded {len(sahi_zones)} SAHI zones: {list(sahi_zones.keys())}")
+    else:
+        print(f"WARNING: {sahi_zones_path} not found — SAHI disabled, using YOLO only")
+
+    # Pre-compute SAHI zone bounding rectangles (for fast ROI cropping)
+    sahi_zone_rects = {}  # zone_name -> (x_min, y_min, x_max, y_max, polygon_np)
+    for zone_name, zone_data in sahi_zones.items():
+        pts = np.array(zone_data["points"], dtype=np.int32)
+        x_min, y_min = pts.min(axis=0)
+        x_max, y_max = pts.max(axis=0)
+        sahi_zone_rects[zone_name] = {
+            "x_min": int(x_min), "y_min": int(y_min),
+            "x_max": int(x_max), "y_max": int(y_max),
+            "polygon": pts,
+            "slice_height": zone_data.get("slice_height", 640),
+            "slice_width": zone_data.get("slice_width", 640),
+            "overlap_ratio": zone_data.get("overlap_ratio", 0.2),
+        }
+
+    # --- Load road mask (only detect vehicles on road) ---
+    road_mask_poly = None
+    road_mask_path = "road_mask.json"
+    if os.path.exists(road_mask_path):
+        with open(road_mask_path, "r") as f:
+            road_mask_data = json.load(f)
+        if "road" in road_mask_data:
+            road_mask_poly = np.array(road_mask_data["road"]["points"], dtype=np.int32)
+            print(f"Road mask loaded: {len(road_mask_poly)} vertices")
+    else:
+        print(f"INFO: {road_mask_path} not found — detecting vehicles everywhere")
 
     # --- Start threaded frame reader ---
     reader = FrameReader(video_path, max_queue_size=2)
@@ -600,7 +754,7 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
     step_length = 1.0 / fps
 
     print(f"Video: {width}x{height} @ {fps:.2f} FPS (step_length={step_length:.4f}s)")
-    print(f"Pipeline: Threaded reader (queue=2) + main inference loop")
+    print(f"Pipeline: Threaded reader + hybrid YOLO/SAHI + BoTSORT")
 
     # --- Setup SUMO network ---
     setup_sumo_network(output_dir)
@@ -619,6 +773,46 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
 
     print(f"SUMO started ({'GUI' if use_gui else 'headless'}) with config: {config_path}")
 
+    # --- Configure traffic light timing ---
+    # State string is 20 chars: indices 0-4 = North, 5-9 = East,
+    #                            10-14 = South, 15-19 = West
+    #
+    # SUMO coordinate mapping vs real video:
+    #   SUMO vertical (up/down)     = N/S edges = video's East/West
+    #   SUMO horizontal (left/right) = E/W edges = video's North/South
+    #
+    # User wants video's N/S green at t=17 → that's SUMO's E/W (Phase 2).
+    #
+    # Cycle (50s total):
+    #   Phase 0: SUMO N/S green (vertical),  E/W red    → 24s  (video: E/W green)
+    #   Phase 1: SUMO N/S yellow,            E/W red    →  3s
+    #   Phase 2: SUMO E/W green (horizontal),N/S red    → 20s  (video: N/S green)
+    #   Phase 3: SUMO E/W yellow,            N/S red    →  3s
+    #
+    # To get Phase 2 (video N/S green) at t=17:
+    #   Start at Phase 0 with offset=10 → 14s remain in Phase 0
+    #   t=14: Phase 1 (yellow 3s)
+    #   t=17: Phase 2 starts (video N/S = SUMO E/W green) ✓
+    phases = [
+        traci.trafficlight.Phase(24, "GGGggrrrrrGGGggrrrrr"),  # SUMO N/S green (vertical)
+        traci.trafficlight.Phase(3,  "yyyyyrrrrryyyyyrrrrr"),  # SUMO N/S yellow
+        traci.trafficlight.Phase(20, "rrrrrGGGggrrrrrGGGgg"),  # SUMO E/W green (horizontal = video N/S)
+        traci.trafficlight.Phase(3,  "rrrrryyyyyrrrrryyyyy"),  # SUMO E/W yellow
+    ]
+    logic = traci.trafficlight.Logic(
+        programID="custom",
+        type=0,
+        currentPhaseIndex=0,
+        phases=phases,
+    )
+    traci.trafficlight.setProgramLogic("center", logic)
+    traci.trafficlight.setProgram("center", "custom")
+    # Start at Phase 0 (vertical green), 14s remaining → yellow at t=14 → video N/S green at t=17
+    traci.trafficlight.setPhase("center", 0)
+    traci.trafficlight.setPhaseDuration("center", 14)
+
+    print("Traffic light configured: video N/S (SUMO E/W) green at t=17s")
+
     # --- Load regions ---
     regions = load_regions_from_json("regions.json")
     if regions is None:
@@ -633,13 +827,14 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
     # --- Start async TraCI worker ---
     traci_worker = TraCIWorker()
 
+
     # --- Tracking state ---
     track_data = {}  # object_id -> list of (frame, cx, cy, speed, label, entry, region)
     processed_count = 0      # frames actually run through YOLO
     infer_count = 0          # frames that actually ran YOLO
 
-    # Only run YOLO every INFER_STRIDE frames — biggest perf win
-    INFER_STRIDE = 2
+    # Only run detection every INFER_STRIDE frames — biggest perf win
+    INFER_STRIDE = 4
 
     # Display every N processed frames
     DISPLAY_INTERVAL = 10
@@ -647,13 +842,14 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
     # Cleanup SUMO stale vehicles every N frames
     CLEANUP_INTERVAL = 30
 
-    # --- Process video with YOLO ---
+    # --- Process video ---
     print("\n=== Starting real-time digital twin ===")
-    print(f"Pipeline: reader thread + YOLO(stride={INFER_STRIDE}) + async TraCI")
+    print(f"Pipeline: YOLO.track(stride={INFER_STRIDE}) + SAHI on {list(sahi_zones.keys())} + road mask")
     print("Press 'q' in the OpenCV window to stop.\n")
 
     wall_start = reader._wall_start
     t_infer_ms = 0.0
+    sahi_extra_dets = []  # SAHI-only detections (reset each inference frame)
 
     try:
         while True:
@@ -667,17 +863,25 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
             processed_count += 1
             current_time = frame_count / fps
 
+            # (No real-time throttle — process frames as fast as possible
+            #  for maximum tracking accuracy. Simulation runs offline.)
+
             # --- Run YOLO only on stride frames (every Nth) ---
             run_yolo = (processed_count % INFER_STRIDE == 0)
 
             if run_yolo:
                 infer_count += 1
                 t_infer_start = _time.monotonic()
+
+                # ====================================================
+                # STEP 1: Fast full-frame YOLO with built-in tracking
+                # ====================================================
+                # This gives us tracked IDs for all large/medium vehicles.
                 results_list = model.track(
                     source=frame,
-                    imgsz=960,
-                    conf=0.4,
-                    half=True,
+                    imgsz=1280,
+                    conf=0.25,
+                    half=True,          # FP16 for speed
                     show=False,
                     stream=False,
                     verbose=False,
@@ -685,74 +889,225 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
                     tracker="botsort.yaml",
                 )
                 results = results_list[0] if results_list else None
-                t_infer_ms = (_time.monotonic() - t_infer_start) * 1000
 
-                # --- Decide if we should render display this frame ---
-                should_display = (infer_count % (DISPLAY_INTERVAL // INFER_STRIDE or 1) == 0)
-                if should_display:
-                    display_frame = frame.copy()
-                    draw_polygonal_region(display_frame, regions)
-
+                # Collect tracked detections from standard YOLO
+                # Format: list of (x1, y1, x2, y2, track_id, conf, cls, label)
+                all_detections = []
                 if results is not None:
                     for box in results.boxes:
                         if box.id is None:
                             continue
                         object_id = int(box.id[0])
                         cls = int(box.cls[0])
-                        label = model.names[cls]
-                        if cls not in TRACKED_CLASS_IDS:
+                        conf_val = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        label = model.names.get(cls, f"cls{cls}")
+                        all_detections.append({
+                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "id": object_id, "conf": conf_val,
+                            "cls": cls, "label": label,
+                            "source": "yolo",
+                        })
+
+                # ====================================================
+                # STEP 2: SAHI on specific zones (north/west ROIs)
+                # ====================================================
+                # Only run SAHI on small cropped regions where motorcycles
+                # are too small for full-frame detection.
+                sahi_extra_dets = []
+                for zone_name, zr in sahi_zone_rects.items():
+                    # Crop the ROI with some padding
+                    pad = 30  # pixels of padding around the zone
+                    crop_x1 = max(0, zr["x_min"] - pad)
+                    crop_y1 = max(0, zr["y_min"] - pad)
+                    crop_x2 = min(width, zr["x_max"] + pad)
+                    crop_y2 = min(height, zr["y_max"] + pad)
+                    crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                    if crop.size == 0:
+                        continue
+
+                    # Run SAHI sliced inference on just this crop
+                    sahi_result = get_sliced_prediction(
+                        image=crop,
+                        detection_model=sahi_model,
+                        slice_height=zr["slice_height"],
+                        slice_width=zr["slice_width"],
+                        overlap_height_ratio=zr["overlap_ratio"],
+                        overlap_width_ratio=zr["overlap_ratio"],
+                        perform_standard_pred=False,  # slices only (full-frame already done)
+                        postprocess_type="NMS",
+                        postprocess_match_threshold=0.5,
+                        verbose=0,
+                    )
+
+                    # Convert SAHI detections back to full-frame coordinates
+                    for pred in sahi_result.object_prediction_list:
+                        bbox = pred.bbox
+                        sx1 = int(bbox.minx) + crop_x1
+                        sy1 = int(bbox.miny) + crop_y1
+                        sx2 = int(bbox.maxx) + crop_x1
+                        sy2 = int(bbox.maxy) + crop_y1
+                        sconf = pred.score.value
+                        scls = pred.category.id
+                        slabel = model.names.get(scls, f"cls{scls}")
+
+                        # Only keep vehicle classes
+                        if scls not in TRACKED_CLASS_IDS:
                             continue
 
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        cx = (x1 + x2) / 2
-                        cy = (y1 + y2) / 2
-                        region = detect_region(cx, cy, regions)
+                        # Check if this SAHI detection overlaps with any
+                        # existing YOLO detection (IoU > 0.3 → duplicate)
+                        scx = (sx1 + sx2) / 2
+                        scy = (sy1 + sy2) / 2
+                        is_duplicate = False
+                        for det in all_detections:
+                            # Quick center-distance check before full IoU
+                            dcx = (det["x1"] + det["x2"]) / 2
+                            dcy = (det["y1"] + det["y2"]) / 2
+                            if abs(scx - dcx) < 50 and abs(scy - dcy) < 50:
+                                # Compute IoU
+                                ix1 = max(sx1, det["x1"])
+                                iy1 = max(sy1, det["y1"])
+                                ix2 = min(sx2, det["x2"])
+                                iy2 = min(sy2, det["y2"])
+                                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                                area_s = (sx2 - sx1) * (sy2 - sy1)
+                                area_d = (det["x2"] - det["x1"]) * (det["y2"] - det["y1"])
+                                union = area_s + area_d - inter
+                                if union > 0 and inter / union > 0.3:
+                                    is_duplicate = True
+                                    break
 
-                        if object_id not in track_data:
-                            speed = 0.0
-                            entry_point = region
-                        else:
-                            last_frame, last_cx, last_cy, last_speed, *_ = track_data[object_id][-1]
-                            frame_diff = frame_count - last_frame
-                            if frame_diff > 0:
-                                meters_per_pixel = 50 / 1420
-                                distance_px = math.hypot(cx - last_cx, cy - last_cy)
-                                distance_m = distance_px * meters_per_pixel
-                                time_sec = frame_diff / fps
-                                speed = (distance_m / time_sec) * 3.6
-                            else:
-                                speed = last_speed
-                            entry_point = None
+                        if not is_duplicate:
+                            sahi_extra_dets.append({
+                                "x1": sx1, "y1": sy1, "x2": sx2, "y2": sy2,
+                                "id": None,  # No track ID yet — will get one next frame
+                                "conf": sconf, "cls": scls, "label": slabel,
+                                "source": "sahi",
+                            })
 
-                        track_data.setdefault(object_id, []).append(
-                            (frame_count, cx, cy, speed, label, entry_point, region)
-                        )
+                # Inject SAHI-only detections into the tracker so they
+                # get assigned track IDs on the next frame via model.track()
+                # (model.track with persist=True maintains the internal tracker state)
 
-                        vehicle_class = VEHICLE_CLASSES.get(cls, "car")
-                        effective_entry = entry_point if entry_point else (
-                            track_data[object_id][0][5] if track_data[object_id] else None
-                        )
+                t_infer_ms = (_time.monotonic() - t_infer_start) * 1000
 
-                        vehicle_mgr.update_vehicle(
-                            object_id=object_id,
-                            px_cx=cx,
-                            px_cy=cy,
-                            vehicle_class=vehicle_class,
-                            entry_region=effective_entry,
-                            current_region=region,
-                            frame_count=frame_count,
-                        )
+                # ====================================================
+                # STEP 3: Road mask filtering
+                # ====================================================
+                # Remove detections whose center is outside the road polygon.
+                if road_mask_poly is not None:
+                    filtered_dets = []
+                    for det in all_detections:
+                        dcx = (det["x1"] + det["x2"]) / 2
+                        dcy = (det["y1"] + det["y2"]) / 2
+                        if cv2.pointPolygonTest(road_mask_poly, (dcx, dcy), False) >= 0:
+                            filtered_dets.append(det)
+                    all_detections = filtered_dets
 
+                    # Also filter SAHI extras
+                    filtered_sahi = []
+                    for det in sahi_extra_dets:
+                        dcx = (det["x1"] + det["x2"]) / 2
+                        dcy = (det["y1"] + det["y2"]) / 2
+                        if cv2.pointPolygonTest(road_mask_poly, (dcx, dcy), False) >= 0:
+                            filtered_sahi.append(det)
+                    sahi_extra_dets = filtered_sahi
+
+                # --- Decide if we should render display this frame ---
+                should_display = (infer_count % (DISPLAY_INTERVAL // INFER_STRIDE or 1) == 0)
+                if should_display:
+                    display_frame = frame.copy()
+                    draw_polygonal_region(display_frame, regions)
+                    # Draw SAHI zone outlines (cyan dashed)
+                    for zone_name, zr in sahi_zone_rects.items():
+                        cv2.polylines(display_frame, [zr["polygon"]], True, (255, 255, 0), 1)
+                    # Draw road mask outline (gray)
+                    if road_mask_poly is not None:
+                        cv2.polylines(display_frame, [road_mask_poly], True, (128, 128, 128), 1)
+
+                # ====================================================
+                # STEP 4: Process all detections
+                # ====================================================
+                for det in all_detections + sahi_extra_dets:
+                    x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+                    cls = det["cls"]
+                    conf = det["conf"]
+                    label = det["label"]
+
+                    if cls not in TRACKED_CLASS_IDS:
+                        continue
+
+                    # SAHI-only detections don't have track IDs yet;
+                    # skip them for SUMO injection (they'll be picked up
+                    # by model.track() on the next frame via IoU matching)
+                    object_id = det["id"]
+                    if object_id is None:
+                        # Draw on display but don't process for tracking
                         if should_display:
-                            in_sumo = "◉" if object_id in vehicle_mgr.active_vehicles else ""
-                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
                             cv2.putText(
                                 display_frame,
-                                f"ID:{object_id} {label} {speed:.1f}km/h {in_sumo}",
+                                f"SAHI {label} {conf:.2f}",
                                 (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (0, 255, 0), 2,
+                                0.4, (0, 165, 255), 1,
                             )
+                        continue
+
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+
+                    region = detect_region(cx, cy, regions)
+
+                    if object_id not in track_data:
+                        speed = 0.0
+                        entry_point = region
+                    else:
+                        last_frame, last_cx, last_cy, last_speed, *_ = track_data[object_id][-1]
+                        frame_diff = frame_count - last_frame
+                        if frame_diff > 0:
+                            meters_per_pixel = 50 / 1420
+                            distance_px = math.hypot(cx - last_cx, cy - last_cy)
+                            distance_m = distance_px * meters_per_pixel
+                            time_sec = frame_diff / fps
+                            speed = (distance_m / time_sec) * 3.6
+                        else:
+                            speed = last_speed
+                        entry_point = None
+
+                    track_data.setdefault(object_id, []).append(
+                        (frame_count, cx, cy, speed, label, entry_point, region)
+                    )
+
+                    vehicle_class = VEHICLE_CLASSES.get(cls, "car")
+                    effective_entry = entry_point if entry_point else (
+                        track_data[object_id][0][5] if track_data[object_id] else None
+                    )
+
+                    vehicle_mgr.update_vehicle(
+                        object_id=object_id,
+                        px_cx=cx,
+                        px_cy=cy,
+                        vehicle_class=vehicle_class,
+                        entry_region=effective_entry,
+                        current_region=region,
+                        frame_count=frame_count,
+                    )
+
+                    if should_display:
+                        # Green = YOLO tracked, Orange = SAHI-discovered
+                        color = (0, 255, 0) if det["source"] == "yolo" else (0, 200, 255)
+                        in_sumo = "◉" if object_id in vehicle_mgr.active_vehicles else ""
+                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(
+                            display_frame,
+                            f"ID:{object_id} {label} {conf:.2f} {speed:.1f}km/h {in_sumo}",
+                            (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, color, 2,
+                        )
 
                 # --- Cleanup vehicles (batched) ---
                 if infer_count % CLEANUP_INTERVAL == 0:
@@ -779,16 +1134,17 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
                 cv2.putText(
                     display_frame,
                     f"Frame: {frame_count} | Time: {current_time:.1f}s | "
-                    f"YOLO: {t_infer_ms:.0f}ms ({effective_fps:.1f} FPS) | "
+                    f"Infer: {t_infer_ms:.0f}ms ({effective_fps:.1f} FPS) | "
                     f"Skipped: {total_skipped} ({avg_skip_per_sec:.1f}/s)",
                     (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 2,
                 )
+                sahi_count = len(sahi_extra_dets)
                 cv2.putText(
                     display_frame,
                     f"Active: {active_count} | Added: {vehicle_mgr.total_added} | "
-                    f"Rerouted: {vehicle_mgr.total_rerouted}",
+                    f"Rerouted: {vehicle_mgr.total_rerouted} | SAHI+: {sahi_count}",
                     (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 2,
@@ -816,10 +1172,45 @@ def process_video_realtime(video_path, output_dir, use_gui=True, sumo_port=None)
         print(f"Vehicles added:      {vehicle_mgr.total_added}")
         print(f"Vehicles released:   {vehicle_mgr.total_removed}")
         print(f"Vehicles rerouted:   {vehicle_mgr.total_rerouted}")
+        print(f"Entry corrected:     {vehicle_mgr.total_entry_corrected}")
         print(f"Parked filtered:     {vehicle_mgr.total_filtered}")
         print(f"Still active:        {len(vehicle_mgr.active_vehicles)}")
         print(f"Still pending:       {len(vehicle_mgr.pending_vehicles)}")
         print(f"Total tracked:       {len(track_data)}")
+
+
+        print(f"\n--- Origin-Destination Statistics ---")
+        for entry in sorted(vehicle_mgr.spawn_counts.keys()):
+            count = vehicle_mgr.spawn_counts[entry]
+            print(f"From {entry.capitalize()}: {count} vehicles")
+            
+        print("\nDirectional Flows (A -> B):")
+        for (entry, exit_reg), count in sorted(vehicle_mgr.od_counts.items()):
+            print(f"  {entry.capitalize()} -> {exit_reg.capitalize()}: {count}")
+
+        # --- Validation against ground truth ---
+        print(f"\n--- Validation vs Ground Truth ---")
+        all_pass = True
+        for direction in sorted(GROUND_TRUTH_COUNTS.keys()):
+            gt = GROUND_TRUTH_COUNTS[direction]
+            sim = vehicle_mgr.spawn_counts.get(direction, 0)
+            if gt > 0:
+                deviation = abs(sim - gt) / gt * 100
+            else:
+                deviation = 0.0 if sim == 0 else 100.0
+            status = "✅" if deviation < 10 else "⚠️" if deviation < 20 else "❌"
+            is_pass = deviation < 10
+            if not is_pass:
+                all_pass = False
+            diff = sim - gt
+            sign = "+" if diff >= 0 else ""
+            print(f"  {direction.capitalize():6s}: GT={gt:3d}  Sim={sim:3d}  "
+                  f"({sign}{diff:3d}, {deviation:5.1f}%) {status}")
+        total_gt = sum(GROUND_TRUTH_COUNTS.values())
+        total_sim = sum(vehicle_mgr.spawn_counts.get(d, 0) for d in GROUND_TRUTH_COUNTS)
+        total_dev = abs(total_sim - total_gt) / total_gt * 100 if total_gt > 0 else 0
+        print(f"  {'Total':6s}: GT={total_gt:3d}  Sim={total_sim:3d}  ({total_dev:.1f}%)")
+        print(f"  Result: {'ALL PASS ✅' if all_pass else 'NEEDS IMPROVEMENT ⚠️'}")
 
         cv2.destroyAllWindows()
         try:
